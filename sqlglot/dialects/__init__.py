@@ -68,6 +68,7 @@ DIALECTS = [
     "Athena",
     "BigQuery",
     "ClickHouse",
+    "Cloudberry",
     "Databricks",
     "Doris",
     "Drill",
