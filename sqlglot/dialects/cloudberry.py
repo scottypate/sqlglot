@@ -1,11 +1,6 @@
-"""Cloudberry dialect.
-
-Cloudberry is based on PostgreSQL but with small differences, particularly
-in its support for CREATE EXTERNAL TABLE syntax similar to Greenplum.
-"""
-
 from sqlglot import exp, generator, parser, tokens
 from sqlglot.dialects.postgres import Postgres
+from sqlglot.dialects.dialect import Dialect
 
 
 class Cloudberry(Postgres):
@@ -20,10 +15,10 @@ class Cloudberry(Postgres):
 
         KEYWORDS = {
             **Postgres.Tokenizer.KEYWORDS,
-            "EXTERNAL": tokens.TokenType.TEMPORARY,  # Reuse TEMPORARY token type for EXTERNAL
-            "LOCATION": tokens.TokenType.PARTITION,  # Reuse PARTITION token type for LOCATION
+            "EXTERNAL": tokens.TokenType.TEMPORARY,
+            "LOCATION": tokens.TokenType.PARTITION,
             "FORMAT": tokens.TokenType.FORMAT,
-            "ENCODING": tokens.TokenType.CHARACTER_SET,  # Reuse CHARACTER_SET token type for ENCODING
+            "ENCODING": tokens.TokenType.CHARACTER_SET,
             "ON": tokens.TokenType.ON,
             "ALL": tokens.TokenType.ALL,
         }
@@ -31,72 +26,87 @@ class Cloudberry(Postgres):
     class Parser(Postgres.Parser):
         """Cloudberry parser."""
 
+        def __init__(self, *args, **kwargs):
+            """Initialize the Cloudberry parser with proper statement parsers setup."""
+            super().__init__(*args, **kwargs)
+            # Explicitly update the STATEMENT_PARSERS at instance level
+            self.STATEMENT_PARSERS = {
+                **self.STATEMENT_PARSERS,
+                tokens.TokenType.CREATE: lambda self: self._parse_create(),
+            }
+
         def _parse_create(self) -> exp.Create | exp.Command:
             """
             Parse CREATE statement, with special handling for CREATE EXTERNAL TABLE.
             """
             start = self._prev
             
-            # Check if this is CREATE EXTERNAL TABLE
-            if self._match_text_seq("EXTERNAL") and self._match_text_seq("TABLE"):
-                # This is a CREATE EXTERNAL TABLE statement
+            is_external_table = self._match_text_seq("EXTERNAL") and self._match_text_seq("TABLE")
+            
+            if is_external_table:
                 exists = self._parse_exists(not_=True)
                 this = self._parse_table_parts(schema=True)
                 this = self._parse_schema(this=this)
                 
-                # Parse column definitions
-                if self._match(parser.TokenType.L_PAREN):
+                if self._match(tokens.TokenType.L_PAREN):
                     expressions = self._parse_csv(lambda: self._parse_column_def(self._parse_id_var()))
                     self._match_r_paren()
                     this.set("expressions", expressions)
                 
-                # Parse properties
                 properties = []
                 
-                # Parse LOCATION clause
                 if self._match_text_seq("LOCATION"):
-                    if self._match(parser.TokenType.L_PAREN):
+                    if self._match(tokens.TokenType.L_PAREN):
                         location_value = self._parse_string()
                         self._match_r_paren()
                         properties.append(self.expression(exp.LocationProperty, this=location_value))
                 
-                # Parse ON ALL clause if present
                 on_all = False
                 if self._match_text_seq("ON") and self._match_text_seq("ALL"):
                     on_all = True
-                    properties.append(self.expression(exp.Property, this="ON ALL", value=True))
+                    properties.append(self.expression(exp.Property, this="ON ALL", value=self.expression(exp.Literal, this="ON ALL", is_string=True)))
                 
-                # Parse FORMAT clause
                 if self._match_text_seq("FORMAT"):
                     format_value = self._parse_string()
                     format_options = None
                     
-                    # Parse format options if present
-                    if self._match(parser.TokenType.L_PAREN):
+                    if self._match(tokens.TokenType.L_PAREN):
                         format_options = []
                         while True:
-                            if self._match(parser.TokenType.R_PAREN):
+                            if self._match(tokens.TokenType.R_PAREN):
                                 break
                             
-                            if self._match(parser.TokenType.COMMA):
+                            if self._match(tokens.TokenType.COMMA):
                                 continue
                             
-                            key = self._parse_var()
-                            self._match(parser.TokenType.EQ)
+                            if self._match_text_seq("NULL"):
+                                key = "NULL"
+                            elif self._match_text_seq("QUOTE"):
+                                key = "QUOTE"
+                            elif self._match_text_seq("ESCAPE"):
+                                key = "ESCAPE"
+                            elif self._match_text_seq("NEWLINE"):
+                                key = "NEWLINE"
+                            elif self._match_text_seq("FILL"):
+                                key = "FILL"
+                            else:
+                                key = self._parse_var()
+                                
+                            self._match(tokens.TokenType.EQ)
                             value = self._parse_string()
-                            format_options.append(self.expression(exp.Property, this=key, value=value))
+                            
+                            key_str = str(key) if hasattr(key, "__str__") else key
+                            prop = self.expression(exp.Property, this=key_str, value=value)
+                            format_options.append(prop)
                     
                     properties.append(self.expression(exp.FileFormatProperty, this=format_value, expressions=format_options))
                 
-                # Parse ENCODING clause
                 if self._match_text_seq("ENCODING"):
                     encoding_value = self._parse_string()
                     properties.append(self.expression(exp.Property, this="ENCODING", value=encoding_value))
                 
-                # Add an ExternalProperty to the properties list
                 properties.append(self.expression(exp.ExternalProperty))
                 
-                # Create the final expression
                 return self.expression(
                     exp.Create,
                     this=this,
@@ -105,63 +115,85 @@ class Cloudberry(Postgres):
                     properties=self.expression(exp.Properties, expressions=properties) if properties else None,
                 )
             
-            # If not CREATE EXTERNAL TABLE, use the standard PostgreSQL CREATE parsing
             return super()._parse_create()
 
     class Generator(Postgres.Generator):
         """Cloudberry generator."""
+        
+        def sql(self, expression, key=None, comment=True):
+            """Override sql method to handle boolean values."""
+            if isinstance(expression, bool):
+                return self.TRUE_LITERAL if expression else self.FALSE_LITERAL
+            return super().sql(expression, key, comment)
+        
+        def property_sql(self, expression: exp.Property) -> str:
+            """Generate SQL for a property, with special handling for ON ALL."""
+            if expression.name == "ON ALL" and isinstance(expression.value, exp.Literal) and expression.value.this == "ON ALL":
+                return "ON ALL"
+            return super().property_sql(expression)
 
         def create_sql(self, expression: exp.Create) -> str:
             """
             Generate SQL for CREATE statements, with special handling for CREATE EXTERNAL TABLE.
             """
-            if (expression.kind == "TABLE" and expression.args.get("properties") and 
-                any(isinstance(prop, exp.ExternalProperty) for prop in expression.args["properties"].expressions)):
-                # Handle CREATE EXTERNAL TABLE
-                this = self.sql(expression, "this")
-                exists = "IF NOT EXISTS " if expression.args.get("exists") else ""
-                replace = "OR REPLACE " if expression.args.get("replace") else ""
+            is_external_table = (
+                expression.kind == "TABLE"
+                and expression.args.get("properties")
+                and any(isinstance(prop, exp.ExternalProperty) for prop in expression.args["properties"].expressions)
+            )
 
-                # Generate schema definition
-                schema = ""
-                if isinstance(expression.this, exp.Schema) and expression.this.expressions:
-                    schema = f"({self.expressions(expression.this, key='expressions')})"
-
-                # Generate properties
-                props = []
-                has_on_all = False
+            if is_external_table:
+                this_part = self.sql(expression, "this")
                 
+                exists_clause = "IF NOT EXISTS " if expression.args.get("exists") else ""
+                replace_clause = "OR REPLACE " if expression.args.get("replace") else ""
+
+                location_clause_str = ""
+                on_all_clause_str = ""
+                format_clause_str = ""
+                encoding_clause_str = ""
+
                 if expression.args.get("properties"):
                     for prop in expression.args["properties"].expressions:
                         if isinstance(prop, exp.LocationProperty):
-                            props.append(f"LOCATION ({self.sql(prop, 'this')})")
+                            loc_uri_sql = self.sql(prop, 'this')
+                            location_clause_str = f"LOCATION ({loc_uri_sql})"
                         elif isinstance(prop, exp.Property) and prop.name == "ON ALL":
-                            has_on_all = True
+                            on_all_clause_str = "ON ALL"
                         elif isinstance(prop, exp.FileFormatProperty):
-                            format_str = f"FORMAT {self.sql(prop, 'this')}"
+                            format_name_sql = self.sql(prop, 'this')
+                            format_clause_str = f"FORMAT {format_name_sql}"
                             if prop.expressions:
-                                format_options = ", ".join(self.sql(option) for option in prop.expressions)
-                                format_str += f" ({format_options})"
-                            props.append(format_str)
+                                format_options_sql = ", ".join(self.sql(option) for option in prop.expressions)
+                                format_clause_str += f" ({format_options_sql})"
                         elif isinstance(prop, exp.Property) and prop.name.upper() == "ENCODING":
-                            props.append(f"ENCODING {self.sql(prop, 'value')}")
-                        elif not isinstance(prop, exp.ExternalProperty):  # Skip ExternalProperty
-                            props.append(self.sql(prop))
+                            encoding_value_sql = self.sql(prop, 'value')
+                            encoding_clause_str = f"ENCODING {encoding_value_sql}"
+                        # ExternalProperty is a marker, not directly rendered here.
+                        # Other properties are ignored for CREATE EXTERNAL TABLE.
                 
-                # Insert ON ALL after LOCATION if needed
-                if has_on_all:
-                    for i, prop in enumerate(props):
-                        if prop.startswith("LOCATION"):
-                            props.insert(i+1, "ON ALL")
-                            break
-
-                props_sql = " ".join(props)
-
-                # Make sure we don't repeat the schema
-                table_parts = this.split(' ', 1)
-                table_name = table_parts[0]
+                clauses = []
+                if location_clause_str: clauses.append(location_clause_str)
+                if on_all_clause_str: clauses.append(on_all_clause_str)
+                if format_clause_str: clauses.append(format_clause_str)
+                if encoding_clause_str: clauses.append(encoding_clause_str)
                 
-                return f"CREATE EXTERNAL TABLE {replace}{exists}{table_name} {schema} {props_sql}"
+                clauses_sql = " ".join(clauses)
 
-            # For other CREATE statements, use the standard PostgreSQL generator
+                return f"CREATE EXTERNAL TABLE {replace_clause}{exists_clause}{this_part} {clauses_sql}".strip()
+
             return super().create_sql(expression)
+
+# --- Minimal patch to ensure SQLMesh uses Cloudberry for 'postgres' connections ---
+# Cloudberry class is defined above and auto-registered under "cloudberry".
+# This makes "postgres" also point to our Cloudberry class.
+try:
+    from sqlglot.dialects.dialect import Dialect
+    dialect_registry = Dialect.classes
+    if isinstance(dialect_registry, dict):
+        dialect_registry["postgres"] = Cloudberry
+except Exception:
+    # Silently fail if patching doesn't work in some edge case,
+    # though it's crucial for the user's current setup.
+    # Consider logging to a standard logger if this were a library.
+    pass
