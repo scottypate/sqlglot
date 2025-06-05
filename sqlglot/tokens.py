@@ -425,6 +425,7 @@ class TokenType(AutoName):
     ANALYZE = auto()
     NAMESPACE = auto()
     EXPORT = auto()
+    EXTERNAL = auto()
 
 
 _ALL_TOKEN_TYPES = list(TokenType)

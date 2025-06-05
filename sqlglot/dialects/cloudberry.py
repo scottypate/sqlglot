@@ -15,7 +15,7 @@ class Cloudberry(Postgres):
 
         KEYWORDS = {
             **Postgres.Tokenizer.KEYWORDS,
-            "EXTERNAL": tokens.TokenType.TEMPORARY,
+            "EXTERNAL": tokens.TokenType.EXTERNAL,
             "LOCATION": tokens.TokenType.PARTITION,
             "FORMAT": tokens.TokenType.FORMAT,
             "ENCODING": tokens.TokenType.CHARACTER_SET,
@@ -117,6 +117,55 @@ class Cloudberry(Postgres):
             
             return super()._parse_create()
 
+        def _parse_drop(self, exists: bool = False) -> exp.Drop | exp.Command:
+            """Override _parse_drop to handle EXTERNAL tables."""
+            start = self._prev
+            external = self._match(tokens.TokenType.EXTERNAL)
+            temporary = self._match(tokens.TokenType.TEMPORARY) if not external else False
+            materialized = self._match_text_seq("MATERIALIZED")
+
+            kind = self._match_set(self.CREATABLES) and self._prev.text.upper()
+            if not kind:
+                return self._parse_as_command(start)
+
+            concurrently = self._match_text_seq("CONCURRENTLY")
+            if_exists = exists or self._parse_exists()
+
+            if kind == "COLUMN":
+                this = self._parse_column()
+            else:
+                this = self._parse_table_parts(
+                    schema=True, is_db_reference=self._prev.token_type == tokens.TokenType.SCHEMA
+                )
+
+            cluster = self._parse_on_property() if self._match(tokens.TokenType.ON) else None
+
+            if self._match(tokens.TokenType.L_PAREN, advance=False):
+                expressions = self._parse_wrapped_csv(self._parse_types)
+            else:
+                expressions = None
+
+            drop = self.expression(
+                exp.Drop,
+                exists=if_exists,
+                this=this,
+                expressions=expressions,
+                kind=self.dialect.CREATABLE_KIND_MAPPING.get(kind) or kind,
+                temporary=temporary,
+                materialized=materialized,
+                cascade=self._match_text_seq("CASCADE"),
+                constraints=self._match_text_seq("CONSTRAINTS"),
+                purge=self._match_text_seq("PURGE"),
+                cluster=cluster,
+                concurrently=concurrently,
+            )
+
+            # Add external property if this is an external table
+            if external:
+                drop.set("external", True)
+
+            return drop
+
     class Generator(Postgres.Generator):
         """Cloudberry generator."""
         
@@ -183,6 +232,25 @@ class Cloudberry(Postgres):
                 return f"CREATE EXTERNAL TABLE {replace_clause}{exists_clause}{this_part} {clauses_sql}".strip()
 
             return super().create_sql(expression)
+
+        def drop_sql(self, expression: exp.Drop) -> str:
+            """Override drop_sql to handle external tables."""
+            this = self.sql(expression, "this")
+            expressions = self.expressions(expression, flat=True)
+            expressions = f" ({expressions})" if expressions else ""
+            kind = expression.args["kind"]
+            kind = self.dialect.INVERSE_CREATABLE_KIND_MAPPING.get(kind) or kind
+            exists_sql = " IF EXISTS " if expression.args.get("exists") else " "
+            concurrently_sql = " CONCURRENTLY" if expression.args.get("concurrently") else ""
+            on_cluster = self.sql(expression, "cluster")
+            on_cluster = f" {on_cluster}" if on_cluster else ""
+            temporary = " TEMPORARY" if expression.args.get("temporary") else ""
+            external = " EXTERNAL" if expression.args.get("external") else ""
+            materialized = " MATERIALIZED" if expression.args.get("materialized") else ""
+            cascade = " CASCADE" if expression.args.get("cascade") else ""
+            constraints = " CONSTRAINTS" if expression.args.get("constraints") else ""
+            purge = " PURGE" if expression.args.get("purge") else ""
+            return f"DROP{external}{temporary}{materialized} {kind}{concurrently_sql}{exists_sql}{this}{on_cluster}{expressions}{cascade}{constraints}{purge}"
 
 # --- Minimal patch to ensure SQLMesh uses Cloudberry for 'postgres' connections ---
 # Cloudberry class is defined above and auto-registered under "cloudberry".

@@ -2103,6 +2103,7 @@ class Drop(Expression):
         "purge": False,
         "cluster": False,
         "concurrently": False,
+        "external": False,  # Add support for external tables
     }
 
     @property
@@ -7429,7 +7430,7 @@ def except_(
 
     Args:
         expressions: the SQL code strings, corresponding to the `EXCEPT`'s operands.
-            If `Expression` instances are passed, they will be used as-is.
+            If `Expression` instance are passed, they will be used as-is.
         distinct: set the DISTINCT flag if and only if this is true.
         dialect: the dialect used to parse the input expression.
         copy: whether to copy the expression.
